@@ -1,0 +1,570 @@
+import React, { useState, useEffect } from 'react';
+import { initializeApp } from "firebase/app";
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "firebase/auth";
+import { getFirestore, doc, setDoc, collection, onSnapshot, addDoc, updateDoc } from "firebase/firestore";
+
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : { apiKey: "dummy", projectId: "dummy" };
+const app = initializeApp(firebaseConfig);
+const db = getFirestore(app);
+const auth = getAuth(app);
+
+// 공통 설문 문항 옵션 데이터
+const DEMOGRAPHICS = {
+  q1: { title: "1. 성별", options: ["남", "여"] },
+  q2: { title: "2. 소속", options: ["경상북도", "경상남도", "시.군", "광역시", "산림청"] },
+  q3: { title: "3. 연령", options: ["30세 이하", "31~35세", "36~40세", "41~45세", "46~50세", "51세 이상"] },
+  q4: { title: "4. 직급", options: ["8급 이하", "7급", "6급", "5급", "4급", "3급", "일반인"] },
+  q5: { title: "5. 직렬(종)", options: ["행정직", "기술직", "연구직", "기능직", "별정직", "계약직", "일반인"] },
+  q6: { title: "6. 총근무연수", options: ["1년 이하", "2~5년", "6~10년", "11~15년", "16~20년", "21년 이상"] }
+};
+
+const SATISFACTION_SCALES = {
+  q7: { title: "7. 본 교육과정이 현재나 향후의 업무수행 또는 자기계발에 도움이 된다고 생각하십니까? (교육효과)", options: ["매우 그렇다", "대체로 그렇다", "보통이다", "대체로 그렇지 않다", "전혀 그렇지 않다"] },
+  q8: { title: "8. 본 교육과정의 교과목 편성은 적절하였습니까? (교과편성)", options: ["매우 그렇다", "대체로 그렇다", "보통이다", "대체로 그렇지 않다", "전혀 그렇지 않다"] },
+  q9: { title: "9. 본 교육과정 담당자의 교육운영(지원)에 대한 만족도는 어떠합니까? (교육운영)", options: ["매우 만족스럽다", "만족스럽다", "보통이다", "불만족스럽다", "매우 불만족스럽다"] }
+};
+
+const ENV_SCALES = {
+  options: ["매우만족", "만족", "보통", "불만족", "매우불만족"],
+  items: [
+    { id: "q10_1", label: "(1) 강의실·분임실·산책로" },
+    { id: "q10_2", label: "(2) 식사 및 식당" }
+  ]
+};
+
+const EVALUATION_SCALES = ["매우만족", "만족", "보통", "미흡", "매우미흡"];
+
+export default function SurveyApp() {
+  const [view, setView] = useState('survey'); // 'survey', 'admin-subjects', 'admin-results'
+  const [user, setUser] = useState(null);
+  const [loading, setLoading] = useState(true);
+  
+  // 관리자가 설정 가능한 동적 교과목 목록 (기본값)
+  const [subjects, setSubjects] = useState([]);
+
+  // 제출된 설문 응답 데이터
+  const [responses, setResponses] = useState([]);
+  
+  // 현재 작성 중인 폼 데이터
+  const [formData, setFormData] = useState({});
+
+  // QR 코드용 주소 상태 추가
+  const [qrUrl, setQrUrl] = useState('');
+
+  // 모달 상태 추가 (alert, confirm 오류 해결 및 자체 디자인 적용)
+  const [modal, setModal] = useState({ isOpen: false, type: 'alert', message: '', onConfirm: null });
+
+  useEffect(() => {
+    // 내부 테스트 환경(iframe 등)일 경우 기본 임시 주소 세팅
+    const currentUrl = window.location.href;
+    if (currentUrl === 'about:srcdoc' || currentUrl.includes('sandbox')) {
+      setQrUrl('https://사방기술교육센터-디지털설문.com'); 
+    } else {
+      setQrUrl(currentUrl);
+    }
+  }, []);
+
+  useEffect(() => {
+    const initAuth = async () => {
+      try {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+          await signInAnonymously(auth);
+        }
+      } catch (error) {
+        console.error("Auth Error:", error);
+      }
+    };
+    initAuth();
+
+    const unsubscribeAuth = onAuthStateChanged(auth, (u) => {
+      setUser(u);
+    });
+
+    return () => unsubscribeAuth();
+  }, []);
+
+  useEffect(() => {
+    if (!user) return;
+
+    // 1. 응답 데이터 실시간 동기화
+    const responsesRef = collection(db, 'artifacts', appId, 'public', 'data', 'responses');
+    const unsubResponses = onSnapshot(responsesRef, (snapshot) => {
+      const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      data.sort((a, b) => b.createdAt - a.createdAt); // 최신순 정렬
+      setResponses(data);
+    }, (error) => console.error("Responses fetch error:", error));
+
+    // 2. 교과목 설정 데이터 실시간 동기화
+    const settingsRef = doc(db, 'artifacts', appId, 'public', 'data', 'settings', 'surveySettings');
+    const unsubSettings = onSnapshot(settingsRef, (docSnap) => {
+      if (docSnap.exists() && docSnap.data().subjects) {
+        setSubjects(docSnap.data().subjects);
+      } else {
+        // 데이터베이스에 교과목이 비어있으면 초기 기본값 생성
+        const initialSubjects = ["숲해설과 함께 하는 체험 프로그램", "테라리움 만들기", "숲과의 동행 / 숲길걷기"];
+        setDoc(settingsRef, { subjects: initialSubjects });
+        setSubjects(initialSubjects);
+      }
+      setLoading(false); // 데이터 로딩 완료
+    }, (error) => console.error("Settings fetch error:", error));
+
+    return () => {
+      unsubResponses();
+      unsubSettings();
+    };
+  }, [user]);
+
+  // 뷰 전환 헬퍼
+  const goSurvey = () => { setView('survey'); setFormData({}); };
+  const goAdminSubjects = () => setView('admin-subjects');
+  const goAdminResults = () => setView('admin-results');
+  const goAdminQr = () => setView('admin-qr');
+
+  // 커스텀 모달 제어 함수
+  const showAlert = (message, onConfirm = null) => {
+    setModal({ isOpen: true, type: 'alert', message, onConfirm });
+  };
+  const showConfirm = (message, onConfirm) => {
+    setModal({ isOpen: true, type: 'confirm', message, onConfirm });
+  };
+  const closeModal = () => {
+    setModal({ isOpen: false, type: 'alert', message: '', onConfirm: null });
+  };
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    if (!user) {
+      showAlert("서버와의 연결이 확인되지 않습니다. 잠시 후 다시 시도해주세요.");
+      return;
+    }
+    
+    const newResponse = {
+      ...formData,
+      createdAt: Date.now(),
+      submittedAt: new Date().toLocaleString()
+    };
+    
+    try {
+      // 파이어베이스(Firestore)에 데이터 저장
+      await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'responses'), newResponse);
+      showAlert("설문지를 제출하였습니다. 참여해 주셔서 감사합니다!", () => {
+        setFormData({});
+        setView('survey');
+        window.scrollTo(0, 0);
+      });
+    } catch (error) {
+      console.error("Submit error:", error);
+      showAlert("제출 중 오류가 발생했습니다. 다시 시도해주세요.");
+    }
+  };
+
+  const exportToCSV = () => {
+    if (responses.length === 0) {
+      showAlert("출력할 응답 데이터가 없습니다.");
+      return;
+    }
+
+    // CSV 헤더 생성
+    const headers = [
+      "제출일시", "성별", "소속", "연령", "직급", "직렬", "총근무연수",
+      "Q7.교육효과", "Q8.교과편성", "Q9.교육운영",
+      "Q10_1.강의실등", "Q10_2.식사식당",
+      "Q11_폐지과목명", "Q11_폐지사유", "Q11_신설과목명", "Q11_신설사유", "Q11_좋았던과목명", "Q11_좋았던사유",
+      ...subjects.map(s => `[${s}]업무능력도움`),
+      ...subjects.map(s => `[${s}]강의전문성`),
+      ...subjects.map(s => `[${s}]강의기술태도`),
+      "Q13_추천강사과목명", "Q13_추천강사명",
+      "Q14_개선요구사항"
+    ];
+
+    // CSV 데이터 행 생성
+    const rows = responses.map(r => {
+      const row = [
+        r.submittedAt || "",
+        r.q1 || "", r.q2 || "", r.q3 || "", r.q4 || "", r.q5 || "", r.q6 || "",
+        r.q7 || "", r.q8 || "", r.q9 || "",
+        r.q10_1 || "", r.q10_2 || "",
+        r.q11_abolish_name || "", r.q11_abolish_reason || "",
+        r.q11_new_name || "", r.q11_new_reason || "",
+        r.q11_good_name || "", r.q11_good_reason || ""
+      ];
+
+      subjects.forEach(subject => {
+        row.push(r[`eval_${subject}_helpful`] || "");
+        row.push(r[`eval_${subject}_expertise`] || "");
+        row.push(r[`eval_${subject}_attitude`] || "");
+      });
+
+      row.push(r.q13_subject || "", r.q13_instructor || "", (r.q14 || "").replace(/\n/g, " "));
+      
+      return row.map(cell => `"${String(cell).replace(/"/g, '""')}"`).join(",");
+    });
+
+    const csvContent = "\uFEFF" + headers.join(",") + "\n" + rows.join("\n"); // \uFEFF for Excel UTF-8
+    const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.setAttribute("href", url);
+    link.setAttribute("download", `사방기술교육센터_설문결과_${new Date().toISOString().slice(0,10)}.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
+  const handleInputChange = (field, value) => {
+    setFormData(prev => ({ ...prev, [field]: value }));
+  };
+
+  return (
+    <div className="min-h-screen bg-gray-50 text-gray-800 font-sans">
+      {/* 상단 네비게이션 */}
+      <nav className="bg-emerald-700 text-white shadow-md sticky top-0 z-50">
+        <div className="max-w-4xl mx-auto px-4 py-3 flex justify-between items-center">
+          <div className="text-lg font-bold flex items-center gap-2 cursor-pointer" onClick={goSurvey}>
+            <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253" /></svg>
+            경상북도사방기술교육센터
+          </div>
+          <div className="flex gap-4 text-sm">
+            <button onClick={goSurvey} className={`px-3 py-1 rounded-md transition-colors ${view === 'survey' ? 'bg-emerald-800 font-medium' : 'hover:bg-emerald-600'}`}>설문참여</button>
+            <button onClick={goAdminSubjects} className={`px-3 py-1 rounded-md transition-colors ${view.startsWith('admin') ? 'bg-emerald-800 font-medium' : 'hover:bg-emerald-600'}`}>관리자</button>
+          </div>
+        </div>
+      </nav>
+
+      <main className="max-w-4xl mx-auto p-4 md:p-6 pb-24">
+        {loading && (
+          <div className="flex flex-col items-center justify-center py-20">
+            <div className="w-10 h-10 border-4 border-emerald-500 border-t-transparent rounded-full animate-spin"></div>
+            <p className="mt-4 text-gray-500 font-medium">데이터를 실시간으로 연결하는 중입니다...</p>
+          </div>
+        )}
+        
+        {!loading && view === 'survey' && (
+          <form onSubmit={handleSubmit} className="space-y-8">
+            <div className="bg-white p-6 md:p-10 rounded-2xl shadow-sm border border-gray-100">
+              <h1 className="text-2xl md:text-3xl font-bold text-center text-gray-900 mb-4">교육과정 설문서</h1>
+              <p className="text-gray-600 leading-relaxed text-sm md:text-base text-center break-keep">
+                우리 경상북도사방기술교육센터의 교육과정에 적극 참여하여 주셔서 감사드립니다.<br/>
+                본 설문은 귀하께서 이번에 이수하신 교육과정에 대한 의견을 수렴하여, 향후 보다 나은 교육과정으로 개선·발전시키기 위한 것으로 귀하의 성의 있는 답변을 부탁드립니다.
+              </p>
+            </div>
+
+            {/* 인적사항 (1~6번) */}
+            <div className="bg-white p-6 md:p-8 rounded-2xl shadow-sm border border-gray-100 space-y-6">
+              <h2 className="text-xl font-bold text-emerald-800 border-b pb-2 mb-4">기본 인적사항</h2>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                {Object.entries(DEMOGRAPHICS).map(([key, data]) => (
+                  <div key={key} className="space-y-2">
+                    <label className="font-semibold text-gray-800">{data.title}</label>
+                    <div className="flex flex-wrap gap-3">
+                      {data.options.map((opt, idx) => (
+                        <label key={idx} className="flex items-center gap-1.5 cursor-pointer bg-gray-50 px-3 py-2 rounded-lg border border-gray-200 hover:bg-emerald-50 transition-colors">
+                          <input type="radio" name={key} value={opt} required onChange={(e) => handleInputChange(key, e.target.value)} checked={formData[key] === opt} className="text-emerald-600 focus:ring-emerald-500" />
+                          <span className="text-sm">{opt}</span>
+                        </label>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* 교육운영 만족도 (7~9번) */}
+            <div className="bg-white p-6 md:p-8 rounded-2xl shadow-sm border border-gray-100 space-y-6">
+              <h2 className="text-xl font-bold text-emerald-800 border-b pb-2 mb-4">교육 만족도 평가</h2>
+              {Object.entries(SATISFACTION_SCALES).map(([key, data]) => (
+                <div key={key} className="space-y-3">
+                  <label className="font-semibold text-gray-800 break-keep">{data.title}</label>
+                  <div className="flex flex-col sm:flex-row gap-2 sm:gap-4">
+                    {data.options.map((opt, idx) => (
+                      <label key={idx} className="flex-1 flex items-center justify-center p-3 border rounded-xl cursor-pointer transition-all hover:border-emerald-500 hover:bg-emerald-50 has-[:checked]:border-emerald-600 has-[:checked]:bg-emerald-100 has-[:checked]:font-semibold">
+                        <input type="radio" name={key} value={opt} required onChange={(e) => handleInputChange(key, e.target.value)} checked={formData[key] === opt} className="sr-only" />
+                        <span className="text-sm text-center">{opt}</span>
+                      </label>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            {/* 교육환경 만족도 (10번) */}
+            <div className="bg-white p-6 md:p-8 rounded-2xl shadow-sm border border-gray-100 space-y-6">
+              <h2 className="text-xl font-bold text-emerald-800 border-b pb-2 mb-4">10. 교육환경과 관련하여 느끼신 점을 답변해 주시기 바랍니다.</h2>
+              <div className="space-y-4">
+                {ENV_SCALES.items.map(item => (
+                  <div key={item.id} className="flex flex-col md:flex-row md:items-center justify-between bg-gray-50 p-4 rounded-xl">
+                    <span className="font-medium text-gray-700 mb-3 md:mb-0 md:w-1/3">{item.label}</span>
+                    <div className="flex flex-wrap md:flex-nowrap w-full md:w-2/3 gap-2">
+                      {ENV_SCALES.options.map((opt, idx) => (
+                        <label key={idx} className="flex-1 min-w-[70px] flex justify-center items-center p-2 bg-white border rounded-lg cursor-pointer hover:border-emerald-500 hover:bg-emerald-50 has-[:checked]:border-emerald-600 has-[:checked]:bg-emerald-100 has-[:checked]:font-bold transition-all">
+                          <input type="radio" name={item.id} value={opt} required onChange={(e) => handleInputChange(item.id, e.target.value)} checked={formData[item.id] === opt} className="sr-only" />
+                          <span className="text-xs md:text-sm">{opt}</span>
+                        </label>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* 희망 과정 (11번) */}
+            <div className="bg-white p-6 md:p-8 rounded-2xl shadow-sm border border-gray-100 space-y-4">
+              <h2 className="text-xl font-bold text-emerald-800 border-b pb-2 mb-4">11. 이번 과정에서 폐지 또는 향후 신설을 희망하는 과정</h2>
+              
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div className="space-y-2"><label className="text-sm font-semibold text-gray-700">▶ 폐지 과목명</label><input type="text" className="w-full p-2 border rounded-lg focus:ring-2 focus:ring-emerald-500 outline-none" onChange={(e) => handleInputChange('q11_abolish_name', e.target.value)} value={formData.q11_abolish_name || ''} /></div>
+                <div className="space-y-2"><label className="text-sm font-semibold text-gray-700">사유</label><input type="text" className="w-full p-2 border rounded-lg focus:ring-2 focus:ring-emerald-500 outline-none" onChange={(e) => handleInputChange('q11_abolish_reason', e.target.value)} value={formData.q11_abolish_reason || ''} /></div>
+                
+                <div className="space-y-2"><label className="text-sm font-semibold text-gray-700">▶ 신설 과목명</label><input type="text" className="w-full p-2 border rounded-lg focus:ring-2 focus:ring-emerald-500 outline-none" onChange={(e) => handleInputChange('q11_new_name', e.target.value)} value={formData.q11_new_name || ''} /></div>
+                <div className="space-y-2"><label className="text-sm font-semibold text-gray-700">사유</label><input type="text" className="w-full p-2 border rounded-lg focus:ring-2 focus:ring-emerald-500 outline-none" onChange={(e) => handleInputChange('q11_new_reason', e.target.value)} value={formData.q11_new_reason || ''} /></div>
+                
+                <div className="space-y-2"><label className="text-sm font-semibold text-gray-700">▶ 좋았던 과목명</label><input type="text" className="w-full p-2 border rounded-lg focus:ring-2 focus:ring-emerald-500 outline-none" onChange={(e) => handleInputChange('q11_good_name', e.target.value)} value={formData.q11_good_name || ''} /></div>
+                <div className="space-y-2"><label className="text-sm font-semibold text-gray-700">사유</label><input type="text" className="w-full p-2 border rounded-lg focus:ring-2 focus:ring-emerald-500 outline-none" onChange={(e) => handleInputChange('q11_good_reason', e.target.value)} value={formData.q11_good_reason || ''} /></div>
+              </div>
+            </div>
+
+            {}
+            <div className="bg-white p-6 md:p-8 rounded-2xl shadow-sm border border-gray-100 space-y-6">
+              <h2 className="text-xl font-bold text-emerald-800 border-b pb-2 mb-4">12. 교과목 및 강사 평가 <span className="text-sm font-normal text-gray-500 ml-2">※ 관리자가 설정한 교과목입니다.</span></h2>
+              
+              {subjects.length === 0 ? (
+                <p className="text-gray-500 italic text-center p-4">등록된 평가 대상 교과목이 없습니다.</p>
+              ) : (
+                <div className="space-y-8">
+                  {subjects.map((subject, idx) => (
+                    <div key={idx} className="bg-emerald-50/50 p-4 md:p-6 rounded-xl border border-emerald-100">
+                      <h3 className="font-bold text-lg text-emerald-900 mb-4 flex items-center gap-2">
+                        <span className="bg-emerald-600 text-white w-6 h-6 rounded-full flex items-center justify-center text-sm">{idx + 1}</span>
+                        {subject}
+                      </h3>
+                      
+                      <div className="space-y-4">
+                        {[
+                          { id: "helpful", label: "해당 교과목은 업무능력 향상이나 자기계발에 도움이 될 것이다." },
+                          { id: "expertise", label: "강의 전문성" },
+                          { id: "attitude", label: "강의기술 및 태도" }
+                        ].map(metric => (
+                          <div key={metric.id} className="flex flex-col md:flex-row md:items-center justify-between border-b border-emerald-100/50 pb-3 last:border-0 last:pb-0">
+                            <span className="text-sm font-medium text-gray-700 mb-2 md:mb-0 md:w-5/12 break-keep">{metric.label}</span>
+                            <div className="flex w-full md:w-7/12 gap-1 md:gap-2">
+                               {EVALUATION_SCALES.map((opt, sIdx) => (
+                                 <label key={sIdx} className="flex-1 flex justify-center items-center py-2 px-1 bg-white border border-gray-200 rounded-lg cursor-pointer hover:border-emerald-500 hover:bg-emerald-50 has-[:checked]:border-emerald-600 has-[:checked]:bg-emerald-600 has-[:checked]:text-white transition-all">
+                                   <input type="radio" name={`eval_${subject}_${metric.id}`} value={opt} required onChange={(e) => handleInputChange(`eval_${subject}_${metric.id}`, e.target.value)} checked={formData[`eval_${subject}_${metric.id}`] === opt} className="sr-only" />
+                                   <span className="text-[11px] md:text-sm text-center">{opt}</span>
+                                 </label>
+                               ))}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* 강사 추천 및 기타 의견 (13~14번) */}
+            <div className="bg-white p-6 md:p-8 rounded-2xl shadow-sm border border-gray-100 space-y-6">
+               <h2 className="text-xl font-bold text-emerald-800 border-b pb-2 mb-4">13. 이번 과정에서 강의한 강사를 대체하여 새롭게 추천하고 싶은 강사는?</h2>
+               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                 <div className="space-y-2">
+                   <label className="text-sm font-semibold text-gray-700">교과목명</label>
+                   <input type="text" className="w-full p-2 border rounded-lg focus:ring-2 focus:ring-emerald-500 outline-none" onChange={(e) => handleInputChange('q13_subject', e.target.value)} value={formData.q13_subject || ''} />
+                 </div>
+                 <div className="space-y-2">
+                   <label className="text-sm font-semibold text-gray-700">추천강사</label>
+                   <input type="text" className="w-full p-2 border rounded-lg focus:ring-2 focus:ring-emerald-500 outline-none" onChange={(e) => handleInputChange('q13_instructor', e.target.value)} value={formData.q13_instructor || ''} />
+                 </div>
+               </div>
+            </div>
+
+            <div className="bg-white p-6 md:p-8 rounded-2xl shadow-sm border border-gray-100 space-y-4">
+               <h2 className="text-xl font-bold text-emerald-800 border-b pb-2 mb-2">14. 향후 교육과정 및 교육시설 등 개선요구사항에 대해 기술하여 주시기 바랍니다.</h2>
+               <textarea rows="4" className="w-full p-3 border rounded-xl focus:ring-2 focus:ring-emerald-500 outline-none resize-none" onChange={(e) => handleInputChange('q14', e.target.value)} value={formData.q14 || ''} placeholder="자유롭게 기재해 주세요."></textarea>
+            </div>
+
+            <div className="text-center pt-6">
+          <button type="submit" className="bg-emerald-600 hover:bg-emerald-700 text-white font-bold py-4 px-12 rounded-full shadow-lg hover:shadow-xl transition-all transform hover:-translate-y-1 text-lg">
+            설문지 제출하기
+          </button>
+        </div>
+      </form>
+    )}
+
+    {!loading && view.startsWith('admin') && (
+      <div className="space-y-6">
+        <div className="bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden">
+              <div className="flex border-b">
+                <button onClick={goAdminSubjects} className={`flex-1 py-4 font-bold text-center transition-colors ${view === 'admin-subjects' ? 'bg-emerald-50 text-emerald-700 border-b-2 border-emerald-600' : 'text-gray-500 hover:bg-gray-50'}`}>
+                  12번 문항 교과목 관리
+                </button>
+                <button onClick={goAdminResults} className={`flex-1 py-4 font-bold text-center transition-colors ${view === 'admin-results' ? 'bg-emerald-50 text-emerald-700 border-b-2 border-emerald-600' : 'text-gray-500 hover:bg-gray-50'}`}>
+                  설문 결과 및 다운로드 ({responses.length}건)
+                </button>
+                <button onClick={goAdminQr} className={`flex-1 py-4 font-bold text-center transition-colors ${view === 'admin-qr' ? 'bg-emerald-50 text-emerald-700 border-b-2 border-emerald-600' : 'text-gray-500 hover:bg-gray-50'}`}>
+                  QR 코드 배포
+                </button>
+              </div>
+
+              <div className="p-6 md:p-8">
+                {view === 'admin-subjects' && (
+                  <div className="space-y-6">
+                    <div>
+                      <h3 className="text-xl font-bold text-gray-800 mb-2">동적 교과목 설정 (12번 문항)</h3>
+                      <p className="text-sm text-gray-500">교육과정이 변경될 때마다 이곳에서 평가받을 교과목을 추가하거나 삭제하세요.</p>
+                    </div>
+                    
+                    <ul className="space-y-3">
+                  {subjects.map((subject, idx) => (
+                    <li key={idx} className="flex justify-between items-center p-4 bg-gray-50 border rounded-xl">
+                      <span className="font-medium text-gray-700">{subject}</span>
+                      <button onClick={() => {
+                        showConfirm(`'${subject}' 교과목을 삭제하시겠습니까?`, async () => {
+                          const newSubjects = subjects.filter((_, i) => i !== idx);
+                          const settingsRef = doc(db, 'artifacts', appId, 'public', 'data', 'settings', 'surveySettings');
+                          await updateDoc(settingsRef, { subjects: newSubjects });
+                        });
+                      }} className="text-red-500 hover:text-red-700 hover:bg-red-50 p-2 rounded-lg transition-colors">
+                        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+
+                <form onSubmit={async (e) => {
+                  e.preventDefault();
+                  const input = e.target.elements.newSubject;
+                  const val = input.value.trim();
+                  if (val && user) {
+                    const newSubjects = [...subjects, val];
+                    const settingsRef = doc(db, 'artifacts', appId, 'public', 'data', 'settings', 'surveySettings');
+                    await updateDoc(settingsRef, { subjects: newSubjects });
+                    input.value = '';
+                  }
+                }} className="flex gap-2 mt-4">
+                  <input type="text" name="newSubject" placeholder="새로운 교과목명 입력..." className="flex-1 p-3 border rounded-xl focus:ring-2 focus:ring-emerald-500 outline-none" />
+                  <button type="submit" className="bg-gray-800 hover:bg-gray-900 text-white px-6 py-3 rounded-xl font-medium flex items-center gap-2">
+                        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" /></svg>
+                        추가
+                      </button>
+                    </form>
+                  </div>
+                )}
+
+                {}
+                {view === 'admin-results' && (
+                  <div className="space-y-6">
+                    <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
+                      <div>
+                        <h3 className="text-xl font-bold text-gray-800">응답 데이터 내보내기</h3>
+                        <p className="text-sm text-gray-500">수집된 설문 데이터를 구글 스프레드시트나 엑셀에서 열람할 수 있는 CSV 포맷으로 다운로드합니다.</p>
+                      </div>
+                      <button onClick={exportToCSV} className="bg-emerald-600 hover:bg-emerald-700 text-white px-6 py-3 rounded-xl font-bold flex items-center gap-2 shadow-sm whitespace-nowrap">
+                        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
+                        CSV 다운로드 (구글 시트용)
+                      </button>
+                    </div>
+
+                    <div className="bg-gray-50 border rounded-xl p-6 flex flex-col items-center justify-center min-h-[200px]">
+                      <span className="text-4xl font-bold text-emerald-600 mb-2">{responses.length}</span>
+                      <span className="text-gray-600 font-medium">현재까지 수집된 총 응답 수</span>
+                      {responses.length === 0 && (
+                        <p className="text-sm text-gray-400 mt-4">설문에 참여하여 데이터를 쌓아보세요.</p>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {/* QR 코드 배포 화면 */}
+                {view === 'admin-qr' && (
+                  <div className="space-y-6">
+                    <div>
+                      <h3 className="text-xl font-bold text-gray-800 mb-2">QR 코드 생성 및 배포</h3>
+                      <p className="text-sm text-gray-500">교육생들이 휴대폰 카메라로 아래 QR 코드를 스캔하면 즉시 설문지에 접속할 수 있습니다.</p>
+                    </div>
+
+                    <div className="bg-gray-50 border rounded-xl p-8 flex flex-col items-center justify-center">
+                      <div className="w-full max-w-md mb-6 space-y-3">
+                        <label className="text-sm font-bold text-gray-700">접속 주소(URL) 설정</label>
+                        <input 
+                          type="text" 
+                          value={qrUrl} 
+                          onChange={(e) => setQrUrl(e.target.value)} 
+                          className="w-full p-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-emerald-500 outline-none text-gray-700 transition-shadow"
+                          placeholder="실제 배포된 웹 주소를 입력하세요 (예: https://...)"
+                        />
+                        <div className="bg-red-50 text-red-600 p-3 rounded-lg text-xs font-medium break-keep">
+                          💡 <b>안내:</b> 현재 보시는 화면은 '개발용 임시 환경'이라 스마트폰 스캔 시 오류가 발생합니다.<br/>
+                          오른쪽 가이드 문서의 <b>'2단계(인터넷 주소 부여)'</b>를 거쳐 생성된 <b>실제 웹 주소</b>를 위 입력칸에 넣으시면, 정상 작동하는 QR코드가 즉시 생성됩니다.
+                        </div>
+                      </div>
+
+                      <div className="bg-white p-4 rounded-xl shadow-sm border border-gray-200 mb-6 transition-all hover:shadow-md">
+                        <img 
+                          src={`https://api.qrserver.com/v1/create-qr-code/?size=250x250&data=${encodeURIComponent(qrUrl || 'https://example.com')}`} 
+                          alt="설문지 접속 QR 코드" 
+                          className="w-48 h-48 md:w-64 md:h-64"
+                        />
+                      </div>
+                      
+                      <div className="flex gap-4">
+                        <button onClick={() => window.print()} className="bg-emerald-600 hover:bg-emerald-700 text-white px-6 py-3 rounded-xl font-bold flex items-center gap-2 shadow-sm">
+                          <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m2 4h6a2 2 0 002-2v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4a2 2 0 002 2zm8-12V5a2 2 0 00-2-2H9a2 2 0 00-2 2v4h10z" /></svg>
+                          이 화면 인쇄하기 (QR출력)
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+      </main>
+
+      {}
+      {/* 커스텀 팝업창 (브라우저 기본 경고창 대체) */}
+      {modal.isOpen && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black bg-opacity-40 p-4 backdrop-blur-sm transition-opacity">
+          <div className="bg-white rounded-2xl shadow-2xl p-6 w-full max-w-sm flex flex-col items-center">
+            {modal.type === 'alert' ? (
+              <div className="w-12 h-12 rounded-full bg-emerald-100 text-emerald-600 flex items-center justify-center mb-4">
+                <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
+              </div>
+            ) : (
+              <div className="w-12 h-12 rounded-full bg-red-100 text-red-600 flex items-center justify-center mb-4">
+                <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" /></svg>
+              </div>
+            )}
+            
+            <p className="text-gray-800 text-center mb-6 break-keep text-lg font-medium">
+              {modal.message}
+            </p>
+            <div className="flex gap-3 justify-center w-full">
+              {modal.type === 'confirm' && (
+                <button 
+                  onClick={closeModal}
+                  className="px-5 py-3 bg-gray-100 hover:bg-gray-200 text-gray-700 font-bold rounded-xl transition-colors w-1/2"
+                >
+                  취소
+                </button>
+              )}
+              <button 
+                onClick={() => {
+                  if (modal.onConfirm) modal.onConfirm();
+                  closeModal();
+                }}
+                className={`px-5 py-3 text-white font-bold rounded-xl transition-colors ${modal.type === 'confirm' ? 'bg-red-500 hover:bg-red-600 w-1/2' : 'bg-emerald-600 hover:bg-emerald-700 w-full'}`}
+              >
+                확인
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
